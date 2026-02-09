@@ -1,3 +1,5 @@
 fastapi
 uvicorn
 psutil
+pytest
+flake8
