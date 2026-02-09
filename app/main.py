@@ -27,10 +27,8 @@ def metrics():
     # Получаем текущие значения
     cpu = psutil.cpu_percent()
     mem = psutil.virtual_memory().percent
-    
     # Обновляем метрики Prometheus
     cpu_gauge.set(cpu)
-    mem_gauge.set(mem)
-    
+    mem_gauge.set(mem) 
     # Возвращаем в формате Prometheus
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
