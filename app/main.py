@@ -1,5 +1,5 @@
 from fastapi import FastAPI
-from prometheus_client import start_http_server, Gauge, generate_latest, CONTENT_TYPE_LATEST
+from prometheus_client import Gauge, generate_latest, CONTENT_TYPE_LATEST
 from fastapi.responses import Response
 import psutil
 
