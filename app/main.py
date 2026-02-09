@@ -26,7 +26,7 @@ def system_info():
 def metrics():
     # Получаем текущие значения
     cpu = psutil.cpu_percent()
-    mem = psutil.virtual_memory().percent    
+    mem = psutil.virtual_memory().percent
     # Обновляем метрики Prometheus
     cpu_gauge.set(cpu)
     mem_gauge.set(mem)
