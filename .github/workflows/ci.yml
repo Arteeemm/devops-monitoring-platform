@@ -37,4 +37,4 @@ jobs:
 
       - name: Build Docker image
         run: |
-          docker build -t devops-monitoring-app .
+          docker build -t devops-monitoring-app -f docker/Dockerfile . 
