@@ -3,14 +3,11 @@ from prometheus_client import Gauge, generate_latest, CONTENT_TYPE_LATEST
 from fastapi.responses import Response
 import psutil
 
-
 app = FastAPI()
-
 
 # Метрики Prometheus
 cpu_gauge = Gauge('system_cpu_percent', 'CPU usage in percent')
 mem_gauge = Gauge('system_memory_percent', 'Memory usage in percent')
-
 
 @app.get("/system")
 def system_info():
@@ -20,7 +17,6 @@ def system_info():
         "cpu_percent": cpu,
         "memory_percent": mem
     }
-
 
 @app.get("/metrics")
 def metrics():
