@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from prometheus_client import start_http_server, Gauge, generate_latest, CONTENT_TYPE_LATEST
 from fastapi.responses import Response
 import psutil
- 
+
 
 app = FastAPI()
 
@@ -13,8 +13,6 @@ mem_gauge = Gauge('system_memory_percent', 'Memory usage in percent')
 
 
 @app.get("/system")
-
-
 def system_info():
     cpu = psutil.cpu_percent()
     mem = psutil.virtual_memory().percent
@@ -24,14 +22,15 @@ def system_info():
     }
 
 
-
 @app.get("/metrics")
-
-
 def metrics():
-    # Обновляем значения
-    cpu_gauge.set(psutil.cpu_percent())
-    mem_gauge.set(psutil.virtual_memory().percent)
+    # Получаем текущие значения
+    cpu = psutil.cpu_percent()
+    mem = psutil.virtual_memory().percent
+    
+    # Обновляем метрики Prometheus
+    cpu_gauge.set(cpu)
+    mem_gauge.set(mem)
+    
     # Возвращаем в формате Prometheus
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
-
