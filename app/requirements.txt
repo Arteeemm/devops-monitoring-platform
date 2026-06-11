@@ -1,6 +1,8 @@
 fastapi
 uvicorn
 psutil
+prometheus-client
 pytest
 httpx
 flake8
+
