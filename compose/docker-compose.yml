@@ -28,6 +28,7 @@ services:
       - "3000:3000"
     volumes:
       - ../monitoring/grafana/provisioning:/etc/grafana/provisioning
+      - ../monitoring/grafana/dashboards:/etc/grafana/dashboards
     networks:
       - devops-net
 
