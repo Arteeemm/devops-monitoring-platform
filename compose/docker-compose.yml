@@ -27,7 +27,7 @@ services:
     ports:
       - "3000:3000"
     volumes:
-      - ../monitoring/grafana/provisioning: /etc/grafana/provisioning
+      - ../monitoring/grafana/provisioning:/etc/grafana/provisioning
     networks:
       - devops-net
 
