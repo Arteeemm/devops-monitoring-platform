@@ -10,4 +10,5 @@ set +a
 envsubst < app.service.template > /tmp/app.service
 sudo cp /tmp/app.service /etc/systemd/system/app.service
 sudo systemctl daemon-reload
+sudo systemctl enable app.service
 sudo systemctl restart app.service
