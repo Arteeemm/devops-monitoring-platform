@@ -192,3 +192,72 @@ bash deploy/deploy.sh
 - добавить персистентные тома для данных Prometheus и Grafana;
 - настроить HTTPS в nginx (Let's Encrypt) при наличии домена;
 - зафиксировать версии зависимостей для воспроизводимости сборки.
+## PostgreSQL: база инвентаря, бэкапы, мониторинг
+
+PostgreSQL 18 установлен на хосте (не в контейнере) и хранит инвентарь лабы: таблицы `hosts` и `services`. Метрики снимает `postgres_exporter`, Prometheus их собирает, Grafana показывает на дашборде **PostgreSQL**.
+
+```mermaid
+flowchart LR
+    pg["PostgreSQL\n127.0.0.1:5432"] -- "роль exporter (pg_monitor)" --> exp["postgres-exporter\n:9187, network_mode: host"]
+    exp --> prom["Prometheus\njob postgres"] --> graf["Grafana\nдашборд PostgreSQL"]
+    timer["db-backup.timer\n03:00"] --> svc["db-backup.service\nUser=postgres"] -- "pg_dump -Fc" --> bk["/var/backups/postgresql\nхранится 7 копий"]
+```
+
+### Безопасность
+
+| Решение | Зачем |
+|---|---|
+| `listen_addresses = '127.0.0.1'` | база не слушает внешние интерфейсы |
+| Роль `exporter` только с `pg_monitor` | экспортер видит статистику, но не данные таблиц (минимальные права) |
+| Бэкап от ОС-пользователя `postgres` | вход по `peer`, пароль нигде не хранится |
+| Пароль экспортера в `compose/.env` (600, в `.gitignore`) | секрет не попадает в репозиторий |
+| Каталог бэкапов `700 postgres:postgres` | дампы читает только владелец |
+
+### Бэкапы
+
+```bash
+sudo install -d -o postgres -g postgres -m 700 /var/backups/postgresql
+sudo install -m 755 deploy/db/backup.sh /usr/local/bin/db-backup.sh
+sudo install -m 755 deploy/db/restore-check.sh /usr/local/bin/db-restore-check.sh
+sudo cp deploy/db/db-backup.service deploy/db/db-backup.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now db-backup.timer
+```
+
+- `db-backup.timer` срабатывает в 03:00; `Persistent=true` выполнит пропущенный запуск после включения сервера.
+- `db-backup.service` (`Type=oneshot`) запускает `pg_dump --format=custom`, пишет во временный файл и переименовывает только после успеха; хранятся 7 последних дампов.
+- `db-restore-check.sh` восстанавливает последний дамп в отдельную базу и сравнивает число строк во всех таблицах. Бэкап без проверки восстановления не считается бэкапом.
+
+```bash
+systemctl list-timers db-backup.timer          # когда следующий запуск
+journalctl -u db-backup.service -n 20          # результат последних запусков
+sudo -u postgres /usr/local/bin/db-restore-check.sh
+```
+
+### Мониторинг
+
+| Панель | Запрос |
+|---|---|
+| Состояние | `pg_up` |
+| Размер базы | `pg_database_size_bytes{datname="inventory"}` |
+| Заполнение пула подключений | `sum(pg_stat_database_numbackends) / scalar(pg_settings_max_connections) * 100` |
+| Подключения по базам | `pg_stat_database_numbackends{datname!~"template.*"}` |
+
+### Траблшутинг: что встретилось на практике
+
+**База остановлена, а цель `postgres` в Prometheus — UP.** Статус цели показывает, отвечает ли экспортер по HTTP, а не жива ли база. Состояние самой базы — метрика `pg_up = 0`. Алерт нужно строить на `pg_up`, а не на `up`.
+
+**Как по сообщению понять, лежит база или не пускает.**
+`connection refused` / `No such file or directory` для сокета `/var/run/postgresql/.s.PGSQL.5432` — порт никто не слушает, процесс не запущен. Сообщение с `FATAL:` пришло от самого PostgreSQL: сервер работает, но отказал по правилу (пароль, `pg_hba.conf`, лимит).
+
+**`FATAL: too many connections for role "inv_admin"`.** На роли стоял `CONNECTION LIMIT 3`, все слоты заняли зависшие сессии. Диагностика: `pg_stat_activity` (кто, откуда, сколько висит) и `rolconnlimit` в `pg_roles`. Решение: `pg_terminate_backend(pid)` для зависших сессий, затем пересмотр лимита. Перезапуск всей базы оборвал бы и рабочие подключения.
+
+**Бэкап упал, `systemctl status` — `failed (Result: exit-code)`.** `pg_dump` не нашёл сокет: база была остановлена. `set -euo pipefail` прерывает скрипт на первой ошибке, поэтому неполный дамп не сохраняется и ротация старых копий не запускается.
+
+**`CREATE ROLE pg_exporter` → ошибка.** Имена с префиксом `pg_` зарезервированы под системные роли. Роль названа `exporter`.
+
+**Не видны детали чужих сессий в `pg_stat_activity`.** Поля `query`, `client_addr` чужих сессий видят только суперпользователь и члены `pg_read_all_stats` (входит в `pg_monitor`).
+
+**`sudo pg_restore /var/backups/postgresql/*.dump` зависает.** Шаблон `*` раскрывает текущая оболочка до запуска `sudo`, от имени обычного пользователя, а у него нет прав на каталог `700`. Шаблон не раскрылся, `pg_restore` ждёт данные со stdin. Решение: раскрывать внутри `sudo -u postgres sh -c '...'`.
+
+**`docker compose up` → `lookup registry-1.docker.io: i/o timeout`.** VirtualBox NAT передал VM DNS-серверы хоста, первый из них отвечал нестабильно. Диагностика: `resolvectl status` (какие DNS у интерфейса), `dig @<сервер> registry-1.docker.io` по каждому серверу.

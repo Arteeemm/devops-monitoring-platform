@@ -1,0 +1,8 @@
+[Unit]
+Description=PostgreSQL backup (inventory)
+After=postgresql.service
+
+[Service]
+Type=oneshot
+User=postgres
+ExecStart=/usr/local/bin/db-backup.sh
