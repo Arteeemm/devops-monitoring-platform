@@ -2,51 +2,79 @@
 
 ![CI](https://github.com/Arteeemm/devops-monitoring-platform/actions/workflows/ci.yml/badge.svg)
 
-Учебный pet-проект, демонстрирующий полный цикл мониторинга приложения: сбор системных метрик, их хранение и визуализацию. Проект можно поднять двумя способами — через Docker Compose (быстрый старт) или как bare-metal сервис на Linux-сервере через systemd и nginx (продовый сценарий без контейнеров). Сборка и тесты проверяются в CI на каждый push.
+Учебный проект: полный цикл мониторинга приложения и базы данных — сбор метрик, хранение, визуализация, резервное копирование. Приложение поднимается двумя способами: через Docker Compose (быстрый старт) или как bare-metal сервис на Linux через systemd и nginx. PostgreSQL работает на хосте, бэкапится по расписанию и мониторится через `postgres_exporter`. Сборка и тесты проверяются в CI на каждый push.
 
-Проект собирался для практики ключевых инструментов DevOps: контейнеризации, оркестрации, мониторинга (Prometheus + Grafana), автоматизации проверок (CI), bare-metal деплоя (systemd, nginx, bash) и конфигурации как кода (provisioning Grafana, шаблонизация systemd-юнита).
+Практика инструментов DevOps и администрирования: контейнеризация, мониторинг (Prometheus + Grafana), CI, bare-metal деплой (systemd, nginx, bash), PostgreSQL (роли, бэкапы, диагностика), конфигурация как код (provisioning Grafana, шаблон systemd-юнита).
+
+## Содержание
+
+- [Что внутри](#что-внутри)
+- [Архитектура](#архитектура)
+- [Стек](#стек)
+- [Структура проекта](#структура-проекта)
+- [Запуск: Docker](#запуск-docker)
+- [Запуск: bare-metal](#запуск-bare-metal-systemd--nginx)
+- [PostgreSQL](#postgresql-база-инвентаря-бэкапы-мониторинг)
+- [Эндпоинты и метрики](#эндпоинты-и-метрики)
+- [CI](#ci)
+- [Траблшутинг](#траблшутинг-что-встретилось-на-практике)
+- [Возможные доработки](#возможные-доработки)
 
 ## Что внутри
 
-- **FastAPI-приложение**, которое измеряет загрузку CPU и оперативной памяти хоста через `psutil` и отдаёт метрики в двух форматах: человекочитаемом JSON и формате Prometheus.
-- **Prometheus**, который по расписанию опрашивает приложение и хранит метрики.
-- **Grafana** с предварительно настроенным (через provisioning) источником данных и готовым дашбордом — графики видны сразу после запуска, без ручной настройки.
-- **Bare-metal деплой**: systemd-сервис для запуска приложения без Docker, nginx как reverse proxy перед ним, и bash-скрипт автодеплоя с healthcheck.
-- **Тесты** на `pytest` и линтер `flake8`.
-- **CI на GitHub Actions**: проверка стиля кода, прогон тестов и сборка Docker-образа на каждый push и pull request.
+- **FastAPI-приложение** измеряет загрузку CPU и памяти хоста через `psutil` и отдаёт метрики в JSON и в формате Prometheus.
+- **Prometheus** по расписанию опрашивает приложение и `postgres_exporter`, хранит метрики.
+- **Grafana** с источником данных и дашбордами, подключёнными через provisioning: **System metrics** и **PostgreSQL** видны сразу после запуска.
+- **PostgreSQL** на хосте: база инвентаря лабы, ежедневный бэкап по systemd timer с проверкой восстановления, отдельная роль с минимальными правами для мониторинга.
+- **Bare-metal деплой**: systemd-сервис, nginx как reverse proxy, bash-скрипт автодеплоя с healthcheck.
+- **Тесты** на `pytest`, линтер `flake8`, **CI** на GitHub Actions.
 
 ## Архитектура
 
-**Docker-сценарий:**
+**Docker-сценарий + PostgreSQL на хосте:**
 
 ```mermaid
 flowchart LR
-    app["FastAPI app\nотдаёт /metrics"] --> prom["Prometheus\nсобирает метрики"]
-    prom --> graf["Grafana\nрисует графики"]
+    subgraph docker["Docker, сеть devops-net"]
+        app["devops-app :8000\n/metrics"]
+        prom["Prometheus :9090"]
+        graf["Grafana :3000"]
+    end
+    subgraph host["Хост"]
+        pg["PostgreSQL\n127.0.0.1:5432"]
+        exp["postgres-exporter :9187\nnetwork_mode: host"]
+        timer["db-backup.timer 03:00"] --> svc["db-backup.service"]
+    end
+    app --> prom
+    exp -- "host.docker.internal:9187" --> prom
+    pg --> exp
+    svc -- "pg_dump" --> bk["/var/backups/postgresql"]
+    prom --> graf
 ```
 
-Все три сервиса работают в одной сети Docker (`devops-net`) и обращаются друг к другу по имени контейнера. Prometheus сам ходит на эндпоинт `/metrics` приложения и забирает данные (pull-модель), Grafana запрашивает их у Prometheus.
+Сервисы в сети `devops-net` обращаются друг к другу по имени контейнера. Prometheus сам забирает метрики (pull-модель). PostgreSQL слушает только `127.0.0.1`, поэтому экспортер запущен в сети хоста, а Prometheus достаёт его через `host.docker.internal`.
 
 **Bare-metal сценарий:**
 
 ```mermaid
 flowchart LR
     client["Клиент"] --> nginx["nginx :80\nreverse proxy"]
-    nginx --> app["uvicorn :8000\nуправляется systemd"]
+    nginx --> app["uvicorn 127.0.0.1:8000\nуправляется systemd"]
 ```
 
-nginx принимает запросы на 80-м порту и проксирует их на приложение, которое слушает только `127.0.0.1:8000` и снаружи недоступно напрямую. Эндпоинт `/metrics` дополнительно закрыт правилом `deny all` — снаружи отдаёт 403, изнутри сервера доступен.
+Приложение слушает только `127.0.0.1:8000` и снаружи недоступно напрямую. Эндпоинт `/metrics` в nginx закрыт `deny all`: снаружи 403, с самого сервера доступен.
 
-## Стек технологий
+## Стек
 
 | Слой | Технологии |
 |------|------------|
 | Приложение | Python, FastAPI, psutil, prometheus-client |
-| Мониторинг | Prometheus, Grafana |
+| База данных | PostgreSQL, pg_dump / pg_restore |
+| Мониторинг | Prometheus, Grafana, postgres_exporter |
 | Контейнеризация | Docker, Docker Compose |
-| Bare-metal деплой | systemd, nginx, bash, envsubst |
+| Bare-metal | systemd (service + timer), nginx, bash, envsubst, ufw |
 | Тесты и качество | pytest, flake8 |
-| CI/CD | GitHub Actions |
+| CI | GitHub Actions |
 
 ## Структура проекта
 
@@ -56,151 +84,123 @@ nginx принимает запросы на 80-м порту и проксир�
 │   ├── main.py                     # FastAPI-приложение, метрики CPU и RAM
 │   └── requirements.txt
 ├── docker/
-│   └── Dockerfile                  # сборка образа приложения
+│   └── Dockerfile                  # образ приложения
 ├── compose/
-│   └── docker-compose.yml          # оркестрация: app + prometheus + grafana
+│   ├── docker-compose.yml          # app + prometheus + grafana + postgres-exporter
+│   └── .env                        # пароль экспортера (создаётся вручную, в .gitignore)
 ├── monitoring/
-│   ├── prometheus.yml              # конфиг Prometheus (что и где опрашивать)
+│   ├── prometheus.yml              # цели опроса: app, postgres
 │   └── grafana/
 │       ├── provisioning/
-│       │   ├── datasources/        # автоподключение Prometheus как источника
+│       │   ├── datasources/        # Prometheus как источник данных
 │       │   └── dashboards/         # провайдер дашбордов
-│       └── dashboards/             # сам дашборд (System metrics)
-├── deploy/                         # bare-metal деплой: systemd + nginx + автодеплой
-│   ├── config.env                  # единственное место с юзером/путём/портом для конкретной машины
-│   ├── app.service.template        # шаблон systemd unit с плейсхолдерами ${APP_USER} и т.д.
-│   ├── install-service.sh          # разовая установка systemd-сервиса (envsubst → unit-файл)
-│   ├── install-nginx.sh            # разовая установка и настройка nginx reverse proxy
-│   ├── deploy.sh                   # регулярное обновление кода (git pull + restart + healthcheck)
-│   └── nginx/
-│       └── app.conf                # конфиг reverse proxy
+│       └── dashboards/
+│           ├── system.json         # System metrics
+│           └── postgres.json       # PostgreSQL
+├── deploy/                         # bare-metal деплой
+│   ├── config.env                  # пользователь, путь и порт для конкретной машины
+│   ├── app.service.template        # шаблон systemd-юнита (${APP_USER} и т.д.)
+│   ├── install-service.sh          # установка systemd-сервиса (envsubst → unit)
+│   ├── install-nginx.sh            # установка nginx reverse proxy
+│   ├── deploy.sh                   # обновление: git pull + restart + healthcheck
+│   ├── nginx/
+│   │   └── app.conf                # конфиг reverse proxy
+│   └── db/                         # PostgreSQL
+│       ├── backup.sh               # pg_dump с ротацией (7 копий)
+│       ├── restore-check.sh        # проверка восстановления последнего дампа
+│       ├── db-backup.service       # что запускать: backup.sh от postgres
+│       └── db-backup.timer         # когда: ежедневно в 03:00
 ├── tests/
 │   └── test_app.py                 # тесты эндпоинтов
 └── .github/workflows/ci.yml        # пайплайн CI
 ```
 
-## Способы запуска
+## Запуск: Docker
 
-### 1. Docker (быстрый старт)
-
-Требуется установленный Docker с Docker Compose.
+Нужен Docker с Docker Compose.
 
 ```bash
 git clone https://github.com/Arteeemm/devops-monitoring-platform.git
 cd devops-monitoring-platform/compose
-docker compose up --build
+docker compose up -d --build
 ```
-
-После запуска доступны:
 
 | Сервис | Адрес | Назначение |
 |--------|-------|------------|
-| Приложение | http://localhost:8000/system | JSON с текущей загрузкой CPU и памяти |
+| Приложение | http://localhost:8000/system | JSON с загрузкой CPU и памяти |
 | Приложение | http://localhost:8000/metrics | метрики в формате Prometheus |
-| Prometheus | http://localhost:9090 | хранилище метрик и поиск по ним |
-| Grafana | http://localhost:3000 | дашборды (логин по умолчанию `admin` / `admin`) |
+| Prometheus | http://localhost:9090 | хранилище метрик, Status → Targets |
+| Grafana | http://localhost:3000 | дашборды (по умолчанию `admin` / `admin`) |
+| postgres-exporter | http://localhost:9187/metrics | метрики PostgreSQL |
 
-В Grafana дашборд **System metrics** уже на месте: раздел Dashboards → System metrics. Графики начинают заполняться через одну-две минуты после запуска (интервал опроса Prometheus по умолчанию — 1 минута).
+Графики заполняются через 1–2 минуты (интервал опроса Prometheus по умолчанию — 1 минута). Без PostgreSQL на хосте стек тоже работает, на дашборде PostgreSQL будет `DOWN`; настройка базы — в разделе [PostgreSQL](#postgresql-база-инвентаря-бэкапы-мониторинг).
 
-### 2. Bare-metal на Linux-сервере (systemd + nginx)
+## Запуск: bare-metal (systemd + nginx)
 
-Альтернатива Docker — запуск приложения напрямую на VM через systemd, с nginx как reverse proxy перед ним. Подходит для практики администрирования Linux без контейнеров.
+Приложение без Docker: systemd запускает uvicorn, nginx стоит перед ним.
 
-**Шаг 1 — клонировать репозиторий и подготовить окружение:**
+**1. Окружение:**
 
 ```bash
 git clone https://github.com/Arteeemm/devops-monitoring-platform.git
 cd devops-monitoring-platform
-sudo apt update && sudo apt install python3.10-venv gettext-base -y
+sudo apt update && sudo apt install -y python3-venv gettext-base
 python3 -m venv venv
-source venv/bin/activate
-pip install -r app/requirements.txt
-deactivate
+venv/bin/pip install -r app/requirements.txt
 ```
 
-**Шаг 2 — настроить `deploy/config.env`** под текущую машину (единственное место, которое нужно менять при переезде на новый сервер):
+**2. `deploy/config.env`** — единственное, что меняется при переезде на другой сервер:
 
 ```bash
-APP_USER=<имя_пользователя>      # узнать через whoami
+APP_USER=<имя_пользователя>      # whoami
 APP_DIR=/home/<имя_пользователя>/devops-monitoring-platform
 APP_PORT=8000
 ```
 
-**Шаг 3 — установить systemd-сервис:**
+**3. systemd-сервис:**
 
 ```bash
-chmod +x deploy/install-service.sh
 ./deploy/install-service.sh
-sudo systemctl status app.service   # должен быть active (running)
+systemctl status app.service        # active (running), enabled
 ```
 
-Скрипт собирает `app.service.template` через `envsubst` (подставляет значения из `config.env`), копирует готовый unit-файл в `/etc/systemd/system/` и перезапускает сервис. Приложение работает от обычного пользователя, а не от root — намеренно, по принципу наименьших привилегий.
+Скрипт подставляет значения из `config.env` в `app.service.template` через `envsubst`, кладёт юнит в `/etc/systemd/system/`, включает автозапуск и перезапускает сервис. Приложение работает от обычного пользователя, а не от root (принцип наименьших привилегий); `Restart=on-failure` поднимает его после падения.
 
-**Шаг 4 — установить nginx как reverse proxy:**
+**4. nginx:**
 
 ```bash
-chmod +x deploy/install-nginx.sh
 ./deploy/install-nginx.sh
+curl localhost/system
 ```
 
-После этого приложение доступно через порт 80 (`curl localhost/system`), а порт 8000 проброшен только на `127.0.0.1` — снаружи недоступен напрямую.
-
-**Шаг 5 — закрыть firewall, оставив только нужные порты:**
+**5. Фаервол** — SSH разрешить до включения, иначе отрежешь себе доступ:
 
 ```bash
-sudo ufw allow 80/tcp
 sudo ufw allow OpenSSH
+sudo ufw allow 80/tcp
 sudo ufw enable
 ```
 
-**Обновление кода** на уже настроенном сервере — одна команда:
+**Обновление кода:**
 
 ```bash
-chmod +x deploy/deploy.sh
 bash deploy/deploy.sh
 ```
 
-`deploy.sh` сам определяет текущую git-ветку, делает `git pull`, переустанавливает зависимости только если изменился `requirements.txt`, перезапускает сервис и проверяет через `curl`, что приложение действительно отвечает — результат каждого запуска пишется в `deploy/deploy.log`.
+`deploy.sh` определяет текущую ветку, делает `git pull`, переустанавливает зависимости только при изменении `requirements.txt`, перезапускает сервис и проверяет через `curl`, что приложение отвечает. Результат пишется в `deploy/deploy.log`.
 
-## Эндпоинты приложения
-
-| Метод | Путь | Описание |
-|-------|------|----------|
-| GET | `/system` | Возвращает JSON вида `{"cpu_percent": ..., "memory_percent": ...}` |
-| GET | `/metrics` | Возвращает те же метрики в формате, который понимает Prometheus |
-
-Экспортируемые метрики: `system_cpu_percent`, `system_memory_percent`.
-
-## CI
-
-Пайплайн (`.github/workflows/ci.yml`) запускается на каждый push и pull request в ветку `main` и выполняет:
-
-1. **Линтинг** кода через `flake8`.
-2. **Прогон тестов** через `pytest`.
-3. **Сборку Docker-образа** приложения.
-
-Так каждое изменение автоматически проверяется на стиль, корректность и собираемость.
-
-## Возможные доработки
-
-Идеи, куда проект можно развивать дальше:
-
-- автоматизировать установку через Ansible (один playbook вместо набора bash-скриптов);
-- добавить алертинг через Alertmanager (уведомления при превышении порогов);
-- расширить набор метрик (диск, сеть) или подключить `node_exporter`;
-- настроить push Docker-образа в registry на этапе CI и/или автодеплой по SSH при пуше в `main` (Continuous Deployment);
-- добавить персистентные тома для данных Prometheus и Grafana;
-- настроить HTTPS в nginx (Let's Encrypt) при наличии домена;
-- зафиксировать версии зависимостей для воспроизводимости сборки.
 ## PostgreSQL: база инвентаря, бэкапы, мониторинг
 
-PostgreSQL 18 установлен на хосте (не в контейнере) и хранит инвентарь лабы: таблицы `hosts` и `services`. Метрики снимает `postgres_exporter`, Prometheus их собирает, Grafana показывает на дашборде **PostgreSQL**.
+PostgreSQL 18 установлен на хосте (не в контейнере) и хранит инвентарь лабы: таблицы `hosts` и `services`.
 
-```mermaid
-flowchart LR
-    pg["PostgreSQL\n127.0.0.1:5432"] -- "роль exporter (pg_monitor)" --> exp["postgres-exporter\n:9187, network_mode: host"]
-    exp --> prom["Prometheus\njob postgres"] --> graf["Grafana\nдашборд PostgreSQL"]
-    timer["db-backup.timer\n03:00"] --> svc["db-backup.service\nUser=postgres"] -- "pg_dump -Fc" --> bk["/var/backups/postgresql\nхранится 7 копий"]
+### Установка и роли
+
+```bash
+sudo apt install -y postgresql
+sudo -u postgres createuser --pwprompt inv_admin
+sudo -u postgres createdb -O inv_admin inventory
+sudo -u postgres psql -c "CREATE ROLE exporter LOGIN PASSWORD '<пароль>'; GRANT pg_monitor TO exporter;"
+echo 'PG_EXPORTER_PASSWORD=<пароль>' > compose/.env && chmod 600 compose/.env
 ```
 
 ### Безопасность
@@ -236,19 +236,41 @@ sudo -u postgres /usr/local/bin/db-restore-check.sh
 
 ### Мониторинг
 
-| Панель | Запрос |
+| Панель дашборда PostgreSQL | Запрос |
 |---|---|
 | Состояние | `pg_up` |
 | Размер базы | `pg_database_size_bytes{datname="inventory"}` |
 | Заполнение пула подключений | `sum(pg_stat_database_numbackends) / scalar(pg_settings_max_connections) * 100` |
 | Подключения по базам | `pg_stat_database_numbackends{datname!~"template.*"}` |
 
-### Траблшутинг: что встретилось на практике
+## Эндпоинты и метрики
+
+| Метод | Путь | Описание |
+|-------|------|----------|
+| GET | `/system` | JSON `{"cpu_percent": ..., "memory_percent": ...}` |
+| GET | `/metrics` | те же значения в формате Prometheus: `system_cpu_percent`, `system_memory_percent` |
+
+## CI
+
+`.github/workflows/ci.yml` запускается на каждый push и pull request в `main`:
+
+1. линтинг `flake8`;
+2. тесты `pytest`;
+3. сборка Docker-образа.
+
+## Траблшутинг: что встретилось на практике
+
+### Приложение и systemd
+
+**README обещал, что приложение доступно только локально, а uvicorn слушал `0.0.0.0`.** `ss -tlnp` показал `0.0.0.0:8000`: порт открыт на всех интерфейсах в обход nginx. В шаблоне юнита адрес заменён на `127.0.0.1`.
+
+**После перезагрузки сервис не поднялся.** `systemctl status` показал `disabled`: юнит был запущен (`start`), но не включён (`enable`). `active` — работает сейчас, `enabled` — запустится при загрузке; это независимые состояния.
+
+### PostgreSQL
 
 **База остановлена, а цель `postgres` в Prometheus — UP.** Статус цели показывает, отвечает ли экспортер по HTTP, а не жива ли база. Состояние самой базы — метрика `pg_up = 0`. Алерт нужно строить на `pg_up`, а не на `up`.
 
-**Как по сообщению понять, лежит база или не пускает.**
-`connection refused` / `No such file or directory` для сокета `/var/run/postgresql/.s.PGSQL.5432` — порт никто не слушает, процесс не запущен. Сообщение с `FATAL:` пришло от самого PostgreSQL: сервер работает, но отказал по правилу (пароль, `pg_hba.conf`, лимит).
+**Как по сообщению понять, лежит база или не пускает.** `connection refused` / `No such file or directory` для сокета `/var/run/postgresql/.s.PGSQL.5432` — порт никто не слушает, процесс не запущен. Сообщение с `FATAL:` пришло от самого PostgreSQL: сервер работает, но отказал по правилу (пароль, `pg_hba.conf`, лимит).
 
 **`FATAL: too many connections for role "inv_admin"`.** На роли стоял `CONNECTION LIMIT 3`, все слоты заняли зависшие сессии. Диагностика: `pg_stat_activity` (кто, откуда, сколько висит) и `rolconnlimit` в `pg_roles`. Решение: `pg_terminate_backend(pid)` для зависших сессий, затем пересмотр лимита. Перезапуск всей базы оборвал бы и рабочие подключения.
 
@@ -260,4 +282,17 @@ sudo -u postgres /usr/local/bin/db-restore-check.sh
 
 **`sudo pg_restore /var/backups/postgresql/*.dump` зависает.** Шаблон `*` раскрывает текущая оболочка до запуска `sudo`, от имени обычного пользователя, а у него нет прав на каталог `700`. Шаблон не раскрылся, `pg_restore` ждёт данные со stdin. Решение: раскрывать внутри `sudo -u postgres sh -c '...'`.
 
+### Docker
+
 **`docker compose up` → `lookup registry-1.docker.io: i/o timeout`.** VirtualBox NAT передал VM DNS-серверы хоста, первый из них отвечал нестабильно. Диагностика: `resolvectl status` (какие DNS у интерфейса), `dig @<сервер> registry-1.docker.io` по каждому серверу.
+
+## Возможные доработки
+
+- алерты через Alertmanager: `pg_up == 0`, неудачный бэкап, высокая загрузка CPU;
+- `node_exporter` вместо самописных метрик (диск, сеть);
+- схема базы инвентаря в `deploy/db/schema.sql`;
+- установка через Ansible вместо набора bash-скриптов;
+- push образа в registry и автодеплой по SSH из CI;
+- персистентные тома для Prometheus и Grafana;
+- HTTPS в nginx (Let's Encrypt);
+- фиксированные версии зависимостей и образов (сейчас Prometheus и Grafana на `latest`).
